@@ -2,6 +2,10 @@ name: Go vuln auto-fix
 
 on:
   workflow_call:
+    secrets:
+      pr_token:
+        description: 'PAT for PR creation — skips close/reopen CI trigger workaround.'
+        required: false
 
 jobs:
   autofix:
@@ -69,6 +73,13 @@ jobs:
           echo "$FINAL" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Detect token type
+        id: token
+        env:
+          PR_TOKEN: ${{ secrets.pr_token }}
+        run: |
+          [ -n "$PR_TOKEN" ] && echo "use_pat=true" >> "$GITHUB_OUTPUT" || echo "use_pat=false" >> "$GITHUB_OUTPUT"
+
       - name: Verify no called vulns remain
         if: steps.scan.outputs.bumped != ''
         env:
@@ -80,7 +91,7 @@ jobs:
         if: steps.scan.outputs.bumped != ''
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.pr_token || secrets.GITHUB_TOKEN }}
           branch: chore/vuln-autofix
           commit-message: "chore: bump deps for govulncheck findings"
           title: "chore: bump deps for govulncheck findings"
@@ -98,9 +109,11 @@ jobs:
       - name: Enable auto-merge
         if: steps.create-pr.outputs.pull-request-number
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.pr_token || secrets.GITHUB_TOKEN }}
           PR_NUM: ${{ steps.create-pr.outputs.pull-request-number }}
         run: |
-          gh pr close --comment "triggering CI" "$PR_NUM"
-          gh pr reopen "$PR_NUM"
+          if [ "${{ steps.token.outputs.use_pat }}" != "true" ]; then
+            gh pr close --comment "triggering CI" "$PR_NUM"
+            gh pr reopen "$PR_NUM"
+          fi
           gh pr merge --auto --squash "$PR_NUM"
