@@ -24,6 +24,8 @@ jobs:
 
       - name: Scan, parse, and bump vulnerable deps
         id: scan
+        env:
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
 
@@ -66,7 +68,7 @@ jobs:
               go get "$bump"
             fi
           done
-          GOTOOLCHAIN=auto go mod tidy
+          go mod tidy
 
           # Store bump list for the PR body.
           echo "bumped<<EOF" >> "$GITHUB_OUTPUT"
