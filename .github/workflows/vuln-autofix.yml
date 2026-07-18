@@ -115,7 +115,10 @@ jobs:
           PR_NUM: ${{ steps.create-pr.outputs.pull-request-number }}
         run: |
           if [ "${{ steps.token.outputs.use_pat }}" != "true" ]; then
-            gh pr close --comment "triggering CI" "$PR_NUM"
-            gh pr reopen "$PR_NUM"
+            # GITHUB_TOKEN events (including this close/reopen) can never start other
+            # workflows, so without a pr_token PAT the PR's CI will not run and
+            # auto-merge will wait forever on required checks. Warn instead of
+            # pretending the old close/reopen dance works.
+            echo "::warning::no pr_token PAT configured — CI will not trigger on this PR and auto-merge will stall until a human closes/reopens it or pushes to the branch"
           fi
           gh pr merge --auto --squash "$PR_NUM"
