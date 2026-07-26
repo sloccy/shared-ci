@@ -16,23 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
-      - name: Fetch Dependabot metadata
-        id: meta
-        uses: dependabot/fetch-metadata@v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Auto-merge security updates (any semver level)
-        if: contains(github.event.pull_request.labels.*.name, 'security')
-        run: gh pr merge --auto --squash "$PR_URL"
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.merge_token || secrets.GITHUB_TOKEN }}
-
-      - name: Auto-merge non-security patch updates
-        if: |
-          steps.meta.outputs.update-type == 'version-update:semver-patch' &&
-          !contains(github.event.pull_request.labels.*.name, 'security')
+      # All caller repos set open-pull-requests-limit: 0, disabling routine version
+      # updates — so every Dependabot PR here is a security update. Merge unconditionally
+      # (still gated on CI by --auto). This is what catches grouped security updates,
+      # which carry neither the 'security' label nor a semver-patch update-type, and
+      # so fell through the old label/update-type checks.
+      - name: Enable auto-merge
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
