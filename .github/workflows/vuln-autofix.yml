@@ -20,6 +20,13 @@ jobs:
           cache: true
 
       - name: Install govulncheck
+        # setup-go exports GOTOOLCHAIN=local so no `go` command silently swaps toolchains.
+        # govulncheck's go.mod floor moves independently of ours (v1.8.0 needs go >= 1.26.0
+        # while go-version-file pins whatever the caller's go.mod says), so this one install
+        # must be allowed to fetch the toolchain it needs. The scan itself stays pinned to
+        # the caller's Go — see the env on the Scan/Verify steps below.
+        env:
+          GOTOOLCHAIN: auto
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Scan, parse, and bump vulnerable deps
@@ -122,3 +129,23 @@ jobs:
             echo "::warning::no pr_token PAT configured — CI will not trigger on this PR and auto-merge will stall until a human closes/reopens it or pushes to the branch"
           fi
           gh pr merge --auto --squash "$PR_NUM"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.pr_token || secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Needs `issues: write` in the CALLING repo's permissions block. Degrade to a
+          # warning rather than masking the real failure above if that's not granted.
+          existing=$(gh issue list --label vuln-autofix-failure --state open \
+                       --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Failed again: $RUN_URL" \
+              || echo "::warning::could not comment on issue #$existing (needs issues: write in the caller's permissions)"
+          else
+            gh issue create --title "vuln-autofix is failing" \
+              --label vuln-autofix-failure \
+              --body "$(printf 'The scheduled govulncheck run is failing, so this repo has no vulnerability coverage until it'"'"'s fixed.\n\nLatest run: %s' "$RUN_URL")" \
+              || echo "::warning::could not open an issue (needs issues: write in the caller's permissions)"
+          fi
