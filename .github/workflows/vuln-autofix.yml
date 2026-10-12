@@ -130,10 +130,35 @@ jobs:
           fi
           gh pr merge --auto --squash "$PR_NUM"
 
+      - name: Wait for PR checks
+        # The bump PR's CI runs as a separate workflow, so a failure there (e.g. CI pinned
+        # to a Go older than the bumped go directive) would otherwise leave a green run and
+        # a silently stuck PR. Fail this run so GitHub emails the owner; the daily rerun
+        # keeps failing until main is actually fixed.
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.pr_token || secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ steps.create-pr.outputs.pull-request-number }}
+        run: |
+          if [ "${{ steps.token.outputs.use_pat }}" != "true" ]; then
+            echo "::error::no pr_token PAT — PR CI never started, so it cannot be verified"
+            exit 1
+          fi
+          # Checks register a few seconds after the PR is pushed; wait for them to appear.
+          for _ in $(seq 1 30); do
+            out=$(gh pr checks "$PR_NUM" 2>&1 || true)
+            grep -q "no checks reported" <<<"$out" || break
+            sleep 10
+          done
+          if ! timeout 40m gh pr checks "$PR_NUM" --watch --fail-fast --interval 30; then
+            echo "::error::checks on PR #$PR_NUM failed or timed out — the bump is stuck and needs manual attention"
+            exit 1
+          fi
+
       - name: Report failure
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.pr_token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}  # not the PAT: self-authored activity sends the owner no email
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Needs `issues: write` in the CALLING repo's permissions block. Degrade to a
