@@ -24,8 +24,8 @@ pusher); set `lint_command` to make it part of the gate instead.
 
 ### Using it
 Copy `templates/security.yml` to `.github/workflows/security.yml` and add the secret
-`WORKFLOW_TOKEN`: a fine-grained PAT for that repo with *Contents*, *Issues* and *Actions*
-read/write and an expiry. The owner must be able to bypass branch protection on the default
+`WORKFLOW_TOKEN`: a fine-grained PAT for that repo with *Contents* read/write and an expiry. (Issues and
+workflow dispatch use the built-in `GITHUB_TOKEN`; the caller grants `issues: write` and `actions: write`.) The owner must be able to bypass branch protection on the default
 branch. Call the workflow at `@v1` (never `@main`).
 
 ### Testing a change

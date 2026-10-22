@@ -48,12 +48,13 @@ on:
         default: ""
     secrets:
       token:
-        description: "Owner PAT (contents, issues, actions: write). Needed so the push triggers the repo's own workflows."
+        description: "Owner PAT with Contents read/write. Needed so the push triggers the repo's own workflows."
         required: true
 
 permissions:
   contents: read
-  issues: write # failure report uses GITHUB_TOKEN so the PAT owner is not the author
+  issues: write  # failure report uses GITHUB_TOKEN so the PAT owner is not the author
+  actions: write # dispatching the rebuild / re-enabling this workflow use GITHUB_TOKEN (workflow_dispatch is exempt from the no-trigger rule), so the PAT needs no Actions scope
 
 jobs:
   security:
@@ -296,6 +297,7 @@ jobs:
       - name: Weekly rebuild
         if: inputs.rebuild_workflow != '' && steps.push.outputs.pushed != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW: ${{ inputs.rebuild_workflow }}
           WEEKDAY: ${{ inputs.rebuild_weekday }}
           FORCE: ${{ inputs.force_rebuild }}
@@ -321,6 +323,7 @@ jobs:
         if: github.event_name == 'schedule' && inputs.target_branch == ''
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           ref="${WORKFLOW_REF%%@*}"
