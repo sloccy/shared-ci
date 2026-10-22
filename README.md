@@ -11,7 +11,7 @@ rebuild. If anything fails: one issue. Dependabot alerts and security PRs are of
 | Step | What it does |
 |---|---|
 | Go | `govulncheck` (called symbols only) -> bump each module to the minimum fixed version; stdlib findings raise the `go` directive |
-| npm | for each advisory, bump to the **lowest** version that clears it (inside the installed major when possible, otherwise the lowest fix in a later major, applied automatically; direct deps then take the newest patch in that minor; overrides stay at the minimum): direct deps get their spec edited (exact pins stay exact), vulnerable transitive deps get a pinned `overrides` entry; each fix is applied one at a time and rolled back if npm cannot resolve it. Works without a committed lockfile. Fixes needing a major bump are only warned about |
+| npm | for each advisory, bump to the **lowest** version that clears it (inside the installed major when possible, otherwise the lowest fix in a later major, applied automatically; direct deps then take the newest patch in that minor; overrides stay at the minimum): direct deps get their spec edited (exact pins stay exact), vulnerable transitive deps get a pinned `overrides` entry; each fix is applied one at a time and rolled back if npm cannot resolve it. Works without a committed lockfile. |
 | `extra_fix_script` | repo-specific bumps (e.g. a pinned Lambda layer) |
 | Gate | `test_command` (default: Go build+test / `npm test`), optional `lint_command`, then govulncheck must be clean |
 | Push | commit by `github-actions[bot]` listing modules + advisory IDs, pushed with the owner PAT so the repo's own publish/deploy workflow runs |
