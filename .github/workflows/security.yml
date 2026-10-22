@@ -113,29 +113,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Exit code 3 = vulnerabilities found; the script decides what to do.
-          govulncheck -json ./... > "$RUNNER_TEMP/vuln.json" || true
-
-          # Only vulnerabilities in CALLED symbols, at the minimum fixed version.
-          jq -r '
-            select(.finding) |
-            select(.finding.trace[0]?.function != null) |
-            select(.finding.fixed_version != null and .finding.fixed_version != "") |
-            ((.finding.trace[0]?.module // "") | if . == "" then "stdlib" else . end)
-              + "@" + .finding.fixed_version + " " + .finding.osv
-          ' "$RUNNER_TEMP/vuln.json" | sort -u > "$RUNNER_TEMP/found.txt"
-
-          if [ ! -s "$RUNNER_TEMP/found.txt" ]; then
-            echo "Go: no called vulnerabilities."
-            exit 0
-          fi
-
-          # One bump per module: the highest fixed version covers every finding in it.
-          FINAL=$(cut -d' ' -f1 "$RUNNER_TEMP/found.txt" | sort -u \
-            | sort -t '@' -k1,1 -k2,2V \
-            | awk -F'@' '{ latest[$1] = $0 } END { for (m in latest) print latest[m] }')
-          IDS=$(cut -d' ' -f2 "$RUNNER_TEMP/found.txt" | sort -u | paste -sd, -)
-
           # Policy: the minimum fixed version. For DIRECT dependencies only, then the newest
           # patch release in that same minor (patches are fixes only, so this picks up quiet
           # backports at almost no risk). Indirect modules and the Go toolchain version stay at
@@ -155,44 +132,72 @@ jobs:
             [ "$(go list -m -f '{{.Indirect}}' "$1" 2>/dev/null || echo true)" = "false" ]
           }
 
-          : > "$RUNNER_TEMP/go-targets.txt"
-          for bump in $FINAL; do
-            module="${bump%%@*}"
-            version="${bump##*@}"
-            if [ "$module" = "stdlib" ]; then
-              v="${version#go}"; v="${v#v}"
-              echo "stdlib $v $v" >> "$RUNNER_TEMP/go-targets.txt"
-            elif is_direct "$module"; then
-              echo "$module $version $(newest_patch_module "$module" "$version")" >> "$RUNNER_TEMP/go-targets.txt"
-            else
-              echo "$module $version $version" >> "$RUNNER_TEMP/go-targets.txt"
-            fi
-          done
+          # One scan-and-bump pass. Returns 1 when there is nothing (left) to fix.
+          go_pass() {
+            # Exit code 3 = vulnerabilities found; the script decides what to do.
+            govulncheck -json ./... > "$RUNNER_TEMP/vuln.json" || true
 
-          {
-            echo "Go bumps (govulncheck, called symbols only; minimum fix, direct modules then newest patch in that minor):"
+            # Only vulnerabilities in CALLED symbols, at the minimum fixed version.
+            jq -r '
+              select(.finding) |
+              select(.finding.trace[0]?.function != null) |
+              select(.finding.fixed_version != null and .finding.fixed_version != "") |
+              ((.finding.trace[0]?.module // "") | if . == "" then "stdlib" else . end)
+                + "@" + .finding.fixed_version + " " + .finding.osv
+            ' "$RUNNER_TEMP/vuln.json" | sort -u > "$RUNNER_TEMP/found.txt"
+            [ -s "$RUNNER_TEMP/found.txt" ] || return 1
+
+            # One bump per module: the highest fixed version covers every finding in it.
+            FINAL=$(cut -d' ' -f1 "$RUNNER_TEMP/found.txt" | sort -u \
+              | sort -t '@' -k1,1 -k2,2V \
+              | awk -F'@' '{ latest[$1] = $0 } END { for (m in latest) print latest[m] }')
+            IDS=$(cut -d' ' -f2 "$RUNNER_TEMP/found.txt" | sort -u | paste -sd, -)
+
+            : > "$RUNNER_TEMP/go-targets.txt"
+            for bump in $FINAL; do
+              module="${bump%%@*}"
+              version="${bump##*@}"
+              if [ "$module" = "stdlib" ]; then
+                v="${version#go}"; v="${v#v}"
+                echo "stdlib $v $v" >> "$RUNNER_TEMP/go-targets.txt"
+              elif is_direct "$module"; then
+                echo "$module $version $(newest_patch_module "$module" "$version")" >> "$RUNNER_TEMP/go-targets.txt"
+              else
+                echo "$module $version $version" >> "$RUNNER_TEMP/go-targets.txt"
+              fi
+            done
+
+            {
+              echo "Go bumps, pass $1 (govulncheck, called symbols only; minimum fix, direct modules then newest patch in that minor):"
+              while read -r mod fixed target; do
+                if [ "$fixed" = "$target" ]; then echo "- $mod $fixed"; else echo "- $mod $fixed -> $target"; fi
+              done < "$RUNNER_TEMP/go-targets.txt"
+              echo "Advisories: $IDS"
+            } >> "$SUMMARY_FILE"
+
             while read -r mod fixed target; do
-              if [ "$fixed" = "$target" ]; then echo "- $mod $fixed"; else echo "- $mod $fixed -> $target"; fi
+              if [ "$mod" = "stdlib" ]; then
+                go mod edit -go="$target"
+                continue
+              fi
+              # Never downgrade: an earlier `go get` may already have pulled this module past
+              # its target, and `go get mod@version` would pin it back down (into a vulnerable
+              # version, as a real test showed).
+              current=$(go list -m -f '{{.Version}}' "$mod" 2>/dev/null || true)
+              if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | tail -1)" = "$current" ]; then
+                echo "Go: $mod already at $current (>= $target)"
+                continue
+              fi
+              go get "$mod@$target"
             done < "$RUNNER_TEMP/go-targets.txt"
-            echo "Advisories: $IDS"
-          } >> "$SUMMARY_FILE"
+            go mod tidy
+          }
 
-          while read -r mod fixed target; do
-            if [ "$mod" = "stdlib" ]; then
-              go mod edit -go="$target"
-              continue
-            fi
-            # Never downgrade: an earlier `go get` may already have pulled this module past
-            # its target, and `go get mod@version` would pin it back down (into a vulnerable
-            # version, as a real test showed).
-            current=$(go list -m -f '{{.Version}}' "$mod" 2>/dev/null || true)
-            if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | tail -1)" = "$current" ]; then
-              echo "Go: $mod already at $current (>= $target)"
-              continue
-            fi
-            go get "$mod@$target"
-          done < "$RUNNER_TEMP/go-targets.txt"
-          go mod tidy
+          # Bumping one module can pull in another version with its own advisory, so repeat
+          # until a scan is clean (bounded). The final gate re-checks everything.
+          for pass in 1 2 3; do
+            go_pass "$pass" || { [ "$pass" -eq 1 ] && echo "Go: no called vulnerabilities."; break; }
+          done
 
       # ── Fix: npm ───────────────────────────────────────────────────────────
       # Bumps each vulnerable package to the LOWEST version that clears its advisories,
