@@ -136,31 +136,71 @@ jobs:
             | awk -F'@' '{ latest[$1] = $0 } END { for (m in latest) print latest[m] }')
           IDS=$(cut -d' ' -f2 "$RUNNER_TEMP/found.txt" | sort -u | paste -sd, -)
 
-          {
-            echo "Go bumps (govulncheck, called symbols only):"
-            while read -r line; do echo "- $line"; done <<< "$FINAL"
-            echo "Advisories: $IDS"
-          } >> "$SUMMARY_FILE"
+          # Policy: the minimum fixed version, then the newest PATCH release in that same
+          # minor (patch releases are fixes only, so this picks up quiet backports at
+          # almost no risk). Falls back to the minimum when no newer patch is found.
+          newest_patch_module() { # $1=module $2=fixed (vX.Y.Z)
+            local mod="$1" fixed="$2" cand
+            [[ "$fixed" =~ ^v([0-9]+)[.]([0-9]+)[.][0-9]+$ ]] || { echo "$fixed"; return; }
+            cand=$(go list -m -versions "$mod" 2>/dev/null | tr ' ' '\n' \
+              | grep -E "^v${BASH_REMATCH[1]}[.]${BASH_REMATCH[2]}[.][0-9]+$" | sort -V | tail -1 || true)
+            if [ -n "$cand" ] && [ "$(printf '%s\n%s\n' "$fixed" "$cand" | sort -V | tail -1)" = "$cand" ]; then
+              echo "$cand"
+            else
+              echo "$fixed"
+            fi
+          }
+          newest_patch_go() { # $1=fixed (X.Y.Z), from the Go team's release list
+            local fixed="$1" cand
+            [[ "$fixed" =~ ^([0-9]+)[.]([0-9]+)[.][0-9]+$ ]] || { echo "$fixed"; return; }
+            cand=$(curl -fsSL 'https://go.dev/dl/?mode=json' 2>/dev/null | jq -r --arg p "go${BASH_REMATCH[1]}.${BASH_REMATCH[2]}." \
+              '[.[].version | select(startswith($p)) | ltrimstr("go") | select(test("^[0-9]+[.][0-9]+[.][0-9]+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' || true)
+            if [ -n "$cand" ] && [ "$(printf '%s\n%s\n' "$fixed" "$cand" | sort -V | tail -1)" = "$cand" ]; then
+              echo "$cand"
+            else
+              echo "$fixed"
+            fi
+          }
 
+          : > "$RUNNER_TEMP/go-targets.txt"
           for bump in $FINAL; do
             module="${bump%%@*}"
             version="${bump##*@}"
             if [ "$module" = "stdlib" ]; then
-              v="${version#go}"; go mod edit -go="${v#v}"
+              v="${version#go}"; v="${v#v}"
+              echo "stdlib $v $(newest_patch_go "$v")" >> "$RUNNER_TEMP/go-targets.txt"
             else
-              go get "$bump"
+              echo "$module $version $(newest_patch_module "$module" "$version")" >> "$RUNNER_TEMP/go-targets.txt"
             fi
           done
+
+          {
+            echo "Go bumps (govulncheck, called symbols only; minimum fix, then newest patch in that minor):"
+            while read -r mod fixed target; do
+              if [ "$fixed" = "$target" ]; then echo "- $mod $fixed"; else echo "- $mod $fixed -> $target"; fi
+            done < "$RUNNER_TEMP/go-targets.txt"
+            echo "Advisories: $IDS"
+          } >> "$SUMMARY_FILE"
+
+          while read -r mod fixed target; do
+            if [ "$mod" = "stdlib" ]; then
+              go mod edit -go="$target"
+            else
+              go get "$mod@$target"
+            fi
+          done < "$RUNNER_TEMP/go-targets.txt"
           go mod tidy
 
       # ── Fix: npm ───────────────────────────────────────────────────────────
-      # Bumps each vulnerable package to the LOWEST version that clears its advisories
-      # (not the newest in range, which is what `npm audit fix` does and which also
-      # crashed/ERESOLVEd on a real repo). Direct dependencies get their spec edited;
-      # vulnerable transitive ones get a pinned `overrides` entry. Fixes are applied one
-      # at a time and rolled back individually if npm cannot resolve them. Packages whose
-      # fix needs a major bump are only warned about. Works without a committed lockfile
-      # (a temporary one is generated for the audit and discarded).
+      # Bumps each vulnerable package to the LOWEST version that clears its advisories,
+      # then to the newest patch release in that same minor (not what `npm audit fix`
+      # does, which takes the newest in range and also crashed/ERESOLVEd on a real repo).
+      # Direct dependencies get their spec edited; vulnerable transitive ones get a pinned
+      # `overrides` entry, tracked in package.json under "x-security-overrides" so only
+      # overrides this job created are ever pruned (once nothing needs them any more).
+      # Fixes are applied one at a time and rolled back individually if npm cannot
+      # resolve them. Packages whose fix needs a major bump are only warned about. Works
+      # without a committed lockfile (a temporary one is generated and discarded).
       - name: npm - bump vulnerable packages to the minimum fixed version
         if: steps.detect.outputs.npm == 'true'
         run: |
@@ -186,18 +226,32 @@ jobs:
           };
           const relock = () => run(['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund']);
 
-          const applied = [], failed = [], manual = [];
+          const MANAGED = 'x-security-overrides'; // overrides created by this job
+          const applied = [], failed = [], manual = [], pruned = [];
           const urlsOf = (own) => [...new Set(own.map((x) => x.url).filter(Boolean))];
+
+          const versionCache = new Map();
+          const stableVersions = (name) => {
+            if (!versionCache.has(name)) {
+              const all = JSON.parse(run(['view', name, 'versions', '--json']));
+              versionCache.set(name, all.filter((v) => !semver.prerelease(v)).sort(semver.compare));
+            }
+            return versionCache.get(name);
+          };
 
           // The lowest stable version above `from` that no own-advisory range covers.
           function minFixed(name, from, ranges, sameMajor) {
-            const versions = JSON.parse(run(['view', name, 'versions', '--json']));
-            return versions
-              .filter((v) => !semver.prerelease(v))
-              .sort(semver.compare)
-              .find((v) => semver.gt(v, from)
-                && (!sameMajor || semver.major(v) === semver.major(from))
-                && !ranges.some((r) => semver.satisfies(v, r)));
+            return stableVersions(name).find((v) => semver.gt(v, from)
+              && (!sameMajor || semver.major(v) === semver.major(from))
+              && !ranges.some((r) => semver.satisfies(v, r)));
+          }
+
+          // Then the newest patch in that same minor (patches are fixes only).
+          function newestPatch(name, to, ranges) {
+            const same = stableVersions(name).filter((v) => semver.major(v) === semver.major(to)
+              && semver.minor(v) === semver.minor(to) && semver.gte(v, to)
+              && !ranges.some((r) => semver.satisfies(v, r)));
+            return same.length ? same[same.length - 1] : to;
           }
 
           function plan(pass) {
@@ -221,7 +275,7 @@ jobs:
                 manual.push(`${name}@${from}: no fix inside major ${semver.major(from)}${major ? ` (first fixed: ${major})` : ''}`);
                 continue;
               }
-              out.push({ name, from, to, isDirect, urls: urlsOf(own) });
+              out.push({ name, from, min: to, to: newestPatch(name, to, ranges), isDirect, urls: urlsOf(own) });
             }
             return out;
           }
@@ -238,6 +292,7 @@ jobs:
               }
             } else {
               pkg.overrides = { ...(pkg.overrides ?? {}), [fix.name]: fix.to };
+              pkg[MANAGED] = [...new Set([...(pkg[MANAGED] ?? []), fix.name])];
             }
             writePkg(pkg, pkgTxt);
             try {
@@ -250,15 +305,39 @@ jobs:
             }
           }
 
+          // Drop overrides this job added once nothing needs them: remove one, re-resolve,
+          // and keep it removed only if the package is no longer reported vulnerable.
+          function prune() {
+            const start = JSON.parse(read('package.json'));
+            for (const name of [...(start[MANAGED] ?? [])]) {
+              const pkgTxt = read('package.json'), lockTxt = read('package-lock.json');
+              const pkg = JSON.parse(pkgTxt);
+              if (pkg.overrides) { delete pkg.overrides[name]; if (!Object.keys(pkg.overrides).length) delete pkg.overrides; }
+              pkg[MANAGED] = (pkg[MANAGED] ?? []).filter((n) => n !== name);
+              if (!pkg[MANAGED].length) delete pkg[MANAGED];
+              writePkg(pkg, pkgTxt);
+              let clean = false;
+              try {
+                relock();
+                const v = audit().vulnerabilities?.[name];
+                clean = !(v && (v.via ?? []).some((x) => typeof x === 'object' && x.name === name));
+              } catch { /* keep the override */ }
+              if (clean) pruned.push(name);
+              else { fs.writeFileSync('package.json', pkgTxt); fs.writeFileSync('package-lock.json', lockTxt); }
+            }
+          }
+
+          prune();
           for (const pass of ['direct', 'transitive']) {
             for (const fix of plan(pass)) apply(fix);
           }
 
-          const lines = applied.map((f) => `- ${f.name} ${f.from} -> ${f.to}${f.isDirect ? '' : ' (override)'} ${f.urls.join(' ')}`);
-          if (lines.length) fs.appendFileSync(summaryFile, `npm minimum-version fixes:\n${lines.join('\n')}\n`);
+          const lines = applied.map((f) => `- ${f.name} ${f.from} -> ${f.to}${f.to !== f.min ? ` (minimum fix ${f.min}, then newest patch in that minor)` : ''}${f.isDirect ? '' : ' (override)'} ${f.urls.join(' ')}`);
+          if (lines.length) fs.appendFileSync(summaryFile, `npm fixes (minimum fix, then newest patch in that minor):\n${lines.join('\n')}\n`);
+          if (pruned.length) fs.appendFileSync(summaryFile, `npm overrides no longer needed, removed: ${pruned.join(', ')}\n`);
           for (const m of manual) console.log(`::warning::npm: ${m}`);
           if (failed.length) fs.writeFileSync(failuresFile, failed.map((f) => `- ${f}`).join('\n') + '\n');
-          console.log(`npm: ${applied.length} fixed, ${failed.length} could not be applied, ${manual.length} need a major bump or manual work`);
+          console.log(`npm: ${applied.length} fixed, ${pruned.length} overrides pruned, ${failed.length} could not be applied, ${manual.length} need a major bump or manual work`);
           JS
 
           # The npm bundled with some Node releases crashes on certain trees
