@@ -10,7 +10,7 @@ rebuild. If anything fails: one issue. GitHub's Dependabot *alerts* are the safe
 | Step | What it does |
 |---|---|
 | Go | `govulncheck` (called symbols only) -> bump each module to the minimum fixed version; stdlib findings raise the `go` directive |
-| npm | for each advisory, bump to the **lowest** version that clears it, same major only: direct deps get their spec edited (exact pins stay exact), vulnerable transitive deps get a pinned `overrides` entry; each fix is applied one at a time and rolled back if npm cannot resolve it. Works without a committed lockfile. Fixes needing a major bump are only warned about |
+| npm | for each advisory, bump to the **lowest** version that clears it, same major only (direct deps then take the newest patch in that minor; overrides stay at the minimum): direct deps get their spec edited (exact pins stay exact), vulnerable transitive deps get a pinned `overrides` entry; each fix is applied one at a time and rolled back if npm cannot resolve it. Works without a committed lockfile. Fixes needing a major bump are only warned about |
 | `extra_fix_script` | repo-specific bumps (e.g. a pinned Lambda layer) |
 | Gate | `test_command` (default: Go build+test / `npm test`), optional `lint_command`, then govulncheck must be clean |
 | Push | commit by `github-actions[bot]` listing modules + advisory IDs, pushed with the owner PAT so the repo's own publish/deploy workflow runs |
@@ -34,7 +34,9 @@ tests but does not push. `target_branch` runs the whole flow against a scratch b
 
 ### Policy
 Dependencies move only for known vulnerabilities, to the **minimum** fixed version (never the
-newest), never for routine version bumps. (Not covered by "minimum": base images and tools that
+newest), never for routine version bumps. *Direct* dependencies (npm direct deps, Go modules without
+`// indirect`) then move to the newest patch release in that same minor; indirect/override pins and
+the Go toolchain version stay at the minimum. (Not covered by "minimum": base images and tools that
 are rebuilt at their latest, e.g. Chainguard and cloudflared.) Dependabot security *PRs* are off; its alerts stay on.
 
 ## Legacy workflows

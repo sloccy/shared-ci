@@ -136,9 +136,10 @@ jobs:
             | awk -F'@' '{ latest[$1] = $0 } END { for (m in latest) print latest[m] }')
           IDS=$(cut -d' ' -f2 "$RUNNER_TEMP/found.txt" | sort -u | paste -sd, -)
 
-          # Policy: the minimum fixed version, then the newest PATCH release in that same
-          # minor (patch releases are fixes only, so this picks up quiet backports at
-          # almost no risk). Falls back to the minimum when no newer patch is found.
+          # Policy: the minimum fixed version. For DIRECT dependencies only, then the newest
+          # patch release in that same minor (patches are fixes only, so this picks up quiet
+          # backports at almost no risk). Indirect modules and the Go toolchain version stay at
+          # the minimum fix. Falls back to the minimum when no newer patch is found.
           newest_patch_module() { # $1=module $2=fixed (vX.Y.Z)
             local mod="$1" fixed="$2" cand
             [[ "$fixed" =~ ^v([0-9]+)[.]([0-9]+)[.][0-9]+$ ]] || { echo "$fixed"; return; }
@@ -150,16 +151,8 @@ jobs:
               echo "$fixed"
             fi
           }
-          newest_patch_go() { # $1=fixed (X.Y.Z), from the Go team's release list
-            local fixed="$1" cand
-            [[ "$fixed" =~ ^([0-9]+)[.]([0-9]+)[.][0-9]+$ ]] || { echo "$fixed"; return; }
-            cand=$(curl -fsSL 'https://go.dev/dl/?mode=json' 2>/dev/null | jq -r --arg p "go${BASH_REMATCH[1]}.${BASH_REMATCH[2]}." \
-              '[.[].version | select(startswith($p)) | ltrimstr("go") | select(test("^[0-9]+[.][0-9]+[.][0-9]+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' || true)
-            if [ -n "$cand" ] && [ "$(printf '%s\n%s\n' "$fixed" "$cand" | sort -V | tail -1)" = "$cand" ]; then
-              echo "$cand"
-            else
-              echo "$fixed"
-            fi
+          is_direct() { # required by this module itself (not an "// indirect" line in go.mod)
+            [ "$(go list -m -f '{{.Indirect}}' "$1" 2>/dev/null || echo true)" = "false" ]
           }
 
           : > "$RUNNER_TEMP/go-targets.txt"
@@ -168,14 +161,16 @@ jobs:
             version="${bump##*@}"
             if [ "$module" = "stdlib" ]; then
               v="${version#go}"; v="${v#v}"
-              echo "stdlib $v $(newest_patch_go "$v")" >> "$RUNNER_TEMP/go-targets.txt"
-            else
+              echo "stdlib $v $v" >> "$RUNNER_TEMP/go-targets.txt"
+            elif is_direct "$module"; then
               echo "$module $version $(newest_patch_module "$module" "$version")" >> "$RUNNER_TEMP/go-targets.txt"
+            else
+              echo "$module $version $version" >> "$RUNNER_TEMP/go-targets.txt"
             fi
           done
 
           {
-            echo "Go bumps (govulncheck, called symbols only; minimum fix, then newest patch in that minor):"
+            echo "Go bumps (govulncheck, called symbols only; minimum fix, direct modules then newest patch in that minor):"
             while read -r mod fixed target; do
               if [ "$fixed" = "$target" ]; then echo "- $mod $fixed"; else echo "- $mod $fixed -> $target"; fi
             done < "$RUNNER_TEMP/go-targets.txt"
@@ -185,16 +180,25 @@ jobs:
           while read -r mod fixed target; do
             if [ "$mod" = "stdlib" ]; then
               go mod edit -go="$target"
-            else
-              go get "$mod@$target"
+              continue
             fi
+            # Never downgrade: an earlier `go get` may already have pulled this module past
+            # its target, and `go get mod@version` would pin it back down (into a vulnerable
+            # version, as a real test showed).
+            current=$(go list -m -f '{{.Version}}' "$mod" 2>/dev/null || true)
+            if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | tail -1)" = "$current" ]; then
+              echo "Go: $mod already at $current (>= $target)"
+              continue
+            fi
+            go get "$mod@$target"
           done < "$RUNNER_TEMP/go-targets.txt"
           go mod tidy
 
       # ── Fix: npm ───────────────────────────────────────────────────────────
       # Bumps each vulnerable package to the LOWEST version that clears its advisories,
-      # then to the newest patch release in that same minor (not what `npm audit fix`
-      # does, which takes the newest in range and also crashed/ERESOLVEd on a real repo).
+      # and, for DIRECT dependencies only, then to the newest patch release in that same minor
+      # (not what `npm audit fix` does, which takes the newest in range and also
+      # crashed/ERESOLVEd on a real repo).
       # Direct dependencies get their spec edited; vulnerable transitive ones get a pinned
       # `overrides` entry, tracked in package.json under "x-security-overrides" so only
       # overrides this job created are ever pruned (once nothing needs them any more).
@@ -246,7 +250,8 @@ jobs:
               && !ranges.some((r) => semver.satisfies(v, r)));
           }
 
-          // Then the newest patch in that same minor (patches are fixes only).
+          // Direct dependencies only: then the newest patch in that same minor (patches are fixes only).
+          // Transitive (override) fixes stay at the minimum.
           function newestPatch(name, to, ranges) {
             const same = stableVersions(name).filter((v) => semver.major(v) === semver.major(to)
               && semver.minor(v) === semver.minor(to) && semver.gte(v, to)
@@ -275,7 +280,7 @@ jobs:
                 manual.push(`${name}@${from}: no fix inside major ${semver.major(from)}${major ? ` (first fixed: ${major})` : ''}`);
                 continue;
               }
-              out.push({ name, from, min: to, to: newestPatch(name, to, ranges), isDirect, urls: urlsOf(own) });
+              out.push({ name, from, min: to, to: isDirect ? newestPatch(name, to, ranges) : to, isDirect, urls: urlsOf(own) });
             }
             return out;
           }
@@ -333,7 +338,7 @@ jobs:
           }
 
           const lines = applied.map((f) => `- ${f.name} ${f.from} -> ${f.to}${f.to !== f.min ? ` (minimum fix ${f.min}, then newest patch in that minor)` : ''}${f.isDirect ? '' : ' (override)'} ${f.urls.join(' ')}`);
-          if (lines.length) fs.appendFileSync(summaryFile, `npm fixes (minimum fix, then newest patch in that minor):\n${lines.join('\n')}\n`);
+          if (lines.length) fs.appendFileSync(summaryFile, `npm fixes (minimum fix; direct deps then newest patch in that minor):\n${lines.join('\n')}\n`);
           if (pruned.length) fs.appendFileSync(summaryFile, `npm overrides no longer needed, removed: ${pruned.join(', ')}\n`);
           for (const m of manual) console.log(`::warning::npm: ${m}`);
           if (failed.length) fs.writeFileSync(failuresFile, failed.map((f) => `- ${f}`).join('\n') + '\n');
