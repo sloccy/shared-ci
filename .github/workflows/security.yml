@@ -158,6 +158,9 @@ jobs:
         if: steps.detect.outputs.npm == 'true'
         run: |
           set -euo pipefail
+          # The npm bundled with Node LTS crashed in `audit fix` on a real repo
+          # ("Cannot read properties of null (reading 'edgesOut')"); current npm is fine.
+          npm install -g npm@latest
           npm ci --no-audit --no-fund
           npm audit --json > "$RUNNER_TEMP/audit.json" || true
 
@@ -165,8 +168,9 @@ jobs:
           urls=$(jq -r '[.vulnerabilities[]?.via[]? | select(type == "object") | .url] | unique | .[]' "$RUNNER_TEMP/audit.json" 2>/dev/null || true)
           [ -z "$urls" ] && { echo "npm: no vulnerabilities."; exit 0; }
 
-          # 1) semver-compatible fixes (lockfile only).
-          npm audit fix --no-audit --no-fund || true
+          # 1) semver-compatible fixes (lockfile only). A non-zero exit is not fatal by
+          #    itself (it can mean "some vulnerabilities remain"); the check below decides.
+          npm audit fix --no-audit --no-fund || echo "::warning::npm audit fix exited non-zero"
 
           # 2) direct dependencies with an exact pin (e.g. vendored front-end libs) that
           #    audit fix leaves alone: bump to the fixed version when it is not a major.
@@ -181,6 +185,17 @@ jobs:
             if [[ "$spec" =~ ^[0-9] ]]; then npm install "$pkg" --save-exact --no-audit --no-fund
             else npm install "$pkg" --no-audit --no-fund; fi
           done
+
+          # Fail loudly if a fix that npm says exists without a major bump is still
+          # unapplied (a silent no-op here is how coverage quietly disappears).
+          npm audit --json > "$RUNNER_TEMP/audit3.json" || true
+          unfixed=$(jq -r '[.vulnerabilities[]? | select(.fixAvailable == true or ((.fixAvailable | type) == "object" and .fixAvailable.isSemVerMajor == false)) | .name] | join(", ")' "$RUNNER_TEMP/audit3.json")
+          if [ -n "$unfixed" ]; then
+            echo "::error::npm reports fixes without a major bump that were not applied: $unfixed"
+            exit 1
+          fi
+          remaining=$(jq -r '[.vulnerabilities[]?.name] | join(", ")' "$RUNNER_TEMP/audit3.json")
+          [ -n "$remaining" ] && echo "::warning::npm vulnerabilities needing a major bump or manual work: $remaining"
 
           if ! git diff --quiet -- package.json package-lock.json; then
             { echo "npm audit fixes:"; while read -r line; do echo "- $line"; done <<< "$urls"; } >> "$SUMMARY_FILE"
