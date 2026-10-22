@@ -1,0 +1,364 @@
+name: Security
+
+# One nightly job per repo: scan -> fix -> test -> push to the default branch.
+# See README.md for the policy and the caller template.
+#
+# Why a PAT pushes directly: a push made with GITHUB_TOKEN never triggers other
+# workflows, so the repo's own publish/deploy workflow would not run. The owner's PAT
+# (secret `token`) bypasses branch protection and starts the normal push workflows.
+
+on:
+  workflow_call:
+    inputs:
+      test_command:
+        description: "Gate that must pass before pushing. Default: go build+test for Go, npm test for npm."
+        type: string
+        default: ""
+      lint_command:
+        description: "Optional extra gate (e.g. golangci-lint run ./...). Empty = lint runs only in the repo's normal CI."
+        type: string
+        default: ""
+      extra_fix_script:
+        description: "Optional repo script that bumps other pinned deps. It may append lines to $SUMMARY_FILE."
+        type: string
+        default: ""
+      binaries:
+        description: "Newline-separated URLs of Go binaries shipped with the project (scanned with govulncheck -mode=binary)."
+        type: string
+        default: ""
+      rebuild_workflow:
+        description: "Workflow file to dispatch weekly so base images/toolchains refresh (e.g. build.yml)."
+        type: string
+        default: ""
+      rebuild_weekday:
+        description: "Weekday for the rebuild, 1=Mon .. 7=Sun (UTC)."
+        type: number
+        default: 1
+      force_rebuild:
+        description: "Dispatch the rebuild workflow now regardless of weekday (testing)."
+        type: boolean
+        default: false
+      dry_run:
+        description: "Scan, fix and test, but do not push or dispatch anything."
+        type: boolean
+        default: false
+      target_branch:
+        description: "Branch to fix and push to instead of the default branch (testing)."
+        type: string
+        default: ""
+    secrets:
+      token:
+        description: "Owner PAT (contents, issues, actions: write). Needed so the push triggers the repo's own workflows."
+        required: true
+
+permissions:
+  contents: read
+  issues: write # failure report uses GITHUB_TOKEN so the PAT owner is not the author
+
+jobs:
+  security:
+    name: Scan, fix, test, push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.token }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.token }}
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Detect ecosystems
+        id: detect
+        run: |
+          echo "SUMMARY_FILE=$RUNNER_TEMP/summary.md" >> "$GITHUB_ENV"
+          echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+          [ -f go.mod ] && echo "go=true" >> "$GITHUB_OUTPUT" || echo "go=false" >> "$GITHUB_OUTPUT"
+          [ -f package-lock.json ] && echo "npm=true" >> "$GITHUB_OUTPUT" || echo "npm=false" >> "$GITHUB_OUTPUT"
+          : > "$RUNNER_TEMP/summary.md"
+
+      - uses: actions/setup-go@v6
+        if: steps.detect.outputs.go == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-go@v6
+        if: steps.detect.outputs.go != 'true' && inputs.binaries != ''
+        with:
+          go-version: stable
+
+      - uses: actions/setup-node@v6
+        if: steps.detect.outputs.npm == 'true'
+        with:
+          node-version: lts/*
+
+      - name: Install govulncheck
+        if: steps.detect.outputs.go == 'true' || inputs.binaries != ''
+        env:
+          # govulncheck's own go.mod floor moves independently of the project's Go
+          # version, so this one install must be allowed to fetch the toolchain it needs.
+          # (An unpinned install with GOTOOLCHAIN=local caused an 11-day silent outage.)
+          GOTOOLCHAIN: auto
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      # ── Fix: Go ────────────────────────────────────────────────────────────
+      - name: Go - scan and bump vulnerable modules
+        if: steps.detect.outputs.go == 'true'
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+
+          # Exit code 3 = vulnerabilities found; the script decides what to do.
+          govulncheck -json ./... > "$RUNNER_TEMP/vuln.json" || true
+
+          # Only vulnerabilities in CALLED symbols, at the minimum fixed version.
+          jq -r '
+            select(.finding) |
+            select(.finding.trace[0]?.function != null) |
+            select(.finding.fixed_version != null and .finding.fixed_version != "") |
+            ((.finding.trace[0]?.module // "") | if . == "" then "stdlib" else . end)
+              + "@" + .finding.fixed_version + " " + .finding.osv
+          ' "$RUNNER_TEMP/vuln.json" | sort -u > "$RUNNER_TEMP/found.txt"
+
+          if [ ! -s "$RUNNER_TEMP/found.txt" ]; then
+            echo "Go: no called vulnerabilities."
+            exit 0
+          fi
+
+          # One bump per module: the highest fixed version covers every finding in it.
+          FINAL=$(cut -d' ' -f1 "$RUNNER_TEMP/found.txt" | sort -u \
+            | sort -t '@' -k1,1 -k2,2V \
+            | awk -F'@' '{ latest[$1] = $0 } END { for (m in latest) print latest[m] }')
+          IDS=$(cut -d' ' -f2 "$RUNNER_TEMP/found.txt" | sort -u | paste -sd, -)
+
+          {
+            echo "Go bumps (govulncheck, called symbols only):"
+            while read -r line; do echo "- $line"; done <<< "$FINAL"
+            echo "Advisories: $IDS"
+          } >> "$SUMMARY_FILE"
+
+          for bump in $FINAL; do
+            module="${bump%%@*}"
+            version="${bump##*@}"
+            if [ "$module" = "stdlib" ]; then
+              v="${version#go}"; go mod edit -go="${v#v}"
+            else
+              go get "$bump"
+            fi
+          done
+          go mod tidy
+
+      # ── Fix: npm ───────────────────────────────────────────────────────────
+      - name: npm - audit and bump vulnerable packages
+        if: steps.detect.outputs.npm == 'true'
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm audit --json > "$RUNNER_TEMP/audit.json" || true
+
+          # Advisories we are about to fix, for the commit message.
+          urls=$(jq -r '[.vulnerabilities[]?.via[]? | select(type == "object") | .url] | unique | .[]' "$RUNNER_TEMP/audit.json" 2>/dev/null || true)
+          [ -z "$urls" ] && { echo "npm: no vulnerabilities."; exit 0; }
+
+          # 1) semver-compatible fixes (lockfile only).
+          npm audit fix --no-audit --no-fund || true
+
+          # 2) direct dependencies with an exact pin (e.g. vendored front-end libs) that
+          #    audit fix leaves alone: bump to the fixed version when it is not a major.
+          npm audit --json > "$RUNNER_TEMP/audit2.json" || true
+          jq -r '.vulnerabilities[]? | select(.isDirect == true)
+                 | select((.fixAvailable | type) == "object")
+                 | select(.fixAvailable.isSemVerMajor == false)
+                 | "\(.fixAvailable.name)@\(.fixAvailable.version)"' "$RUNNER_TEMP/audit2.json" | sort -u |
+          while read -r pkg; do
+            name="${pkg%@*}"
+            spec=$(jq -r --arg n "$name" '(.dependencies[$n] // .devDependencies[$n] // "")' package.json)
+            if [[ "$spec" =~ ^[0-9] ]]; then npm install "$pkg" --save-exact --no-audit --no-fund
+            else npm install "$pkg" --no-audit --no-fund; fi
+          done
+
+          if ! git diff --quiet -- package.json package-lock.json; then
+            { echo "npm audit fixes:"; while read -r line; do echo "- $line"; done <<< "$urls"; } >> "$SUMMARY_FILE"
+          fi
+
+      - name: Extra fixes (repo script)
+        if: inputs.extra_fix_script != ''
+        env:
+          EXTRA: ${{ inputs.extra_fix_script }}
+          GOTOOLCHAIN: auto
+        run: bash -c "$EXTRA"
+
+      # ── Gate and push ──────────────────────────────────────────────────────
+      - name: Commit fixes
+        id: commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Nothing to fix."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Tracked files only: never sweep node_modules or build output into the commit.
+          git add -u
+          {
+            echo "chore: security bumps"
+            echo
+            cat "$SUMMARY_FILE"
+            echo
+            echo "Automated by the sloccy/shared-ci security workflow."
+          } > "$RUNNER_TEMP/commit-msg.txt"
+          git commit -q -F "$RUNNER_TEMP/commit-msg.txt"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Gate - tests
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          HAS_GO: ${{ steps.detect.outputs.go }}
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          if [ -n "$TEST_COMMAND" ]; then
+            bash -c "$TEST_COMMAND"
+          elif [ "$HAS_GO" = "true" ]; then
+            go build ./... && go test ./...
+          else
+            npm ci --no-audit --no-fund && npm test --if-present
+          fi
+
+      - name: Gate - lint (optional)
+        if: steps.commit.outputs.changed == 'true' && inputs.lint_command != ''
+        env:
+          LINT_COMMAND: ${{ inputs.lint_command }}
+          GOTOOLCHAIN: auto
+        run: bash -c "$LINT_COMMAND"
+
+      - name: Gate - no called vulnerabilities remain
+        if: steps.commit.outputs.changed == 'true' && steps.detect.outputs.go == 'true'
+        env:
+          GOTOOLCHAIN: auto
+        run: govulncheck ./...
+
+      - name: Push
+        id: push
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Fix commit"
+            git log -1 --format='%B'
+            git show --stat --format= HEAD
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: not pushing."
+            git show --stat --format=%s HEAD
+            exit 0
+          fi
+          if ! git push origin "HEAD:$BRANCH"; then
+            echo "Push rejected; rebasing once onto the updated branch."
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # ── Shipped binaries (e.g. cloudflared) ────────────────────────────────
+      - name: Scan shipped binaries
+        if: inputs.binaries != ''
+        env:
+          BINARIES: ${{ inputs.binaries }}
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          status=0
+          n=0
+          while read -r url; do
+            [ -z "$url" ] && continue
+            n=$((n + 1))
+            f="$RUNNER_TEMP/bin/$n"
+            curl -fsSL -o "$f" "$url"
+            echo "::group::govulncheck -mode=binary $url"
+            govulncheck -mode=binary "$f" || status=1
+            echo "::endgroup::"
+          done <<< "$BINARIES"
+          exit $status
+
+      # ── Weekly rebuild ─────────────────────────────────────────────────────
+      - name: Weekly rebuild
+        if: inputs.rebuild_workflow != '' && steps.push.outputs.pushed != 'true'
+        env:
+          WORKFLOW: ${{ inputs.rebuild_workflow }}
+          WEEKDAY: ${{ inputs.rebuild_weekday }}
+          FORCE: ${{ inputs.force_rebuild }}
+          BRANCH: ${{ steps.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # A push above already triggered a fresh build, so skip the duplicate.
+          if [ "$FORCE" != "true" ] && [ "$(date -u +%u)" != "$WEEKDAY" ]; then
+            echo "Not rebuild day; skipping."
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: would dispatch $WORKFLOW on $BRANCH."
+            exit 0
+          fi
+          gh workflow run "$WORKFLOW" --ref "$BRANCH"
+
+      # ── Keep the schedule alive ────────────────────────────────────────────
+      # GitHub disables scheduled workflows in public repos after 60 days without repo
+      # activity. Re-enabling this workflow is a best-effort way to reset that timer
+      # (community-reported, not documented). GitHub's Dependabot alerts remain the backstop.
+      - name: Keep schedule enabled
+        if: github.event_name == 'schedule' && inputs.target_branch == ''
+        continue-on-error: true
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          ref="${WORKFLOW_REF%%@*}"
+          gh workflow enable "$(basename "$ref")"
+
+      # ── One failure channel ────────────────────────────────────────────────
+      - name: Report failure
+        if: failure() && inputs.dry_run != true && inputs.target_branch == ''
+        env:
+          GH_TOKEN: ${{ github.token }} # not the PAT: self-authored activity would not email the owner
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=security-automation-failure
+          gh label create "$label" --color B60205 --description "Nightly security automation failed" 2>/dev/null || true
+          body="The nightly security job failed, so this repo may have no vulnerability coverage until it is fixed.
+
+          Latest run: $RUN_URL"
+          if [ -s "$SUMMARY_FILE" ]; then
+            body="$body
+
+          Fixes it was trying to apply:
+          $(cat "$SUMMARY_FILE")"
+          fi
+          existing=$(gh issue list --label "$label" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Failed again: $RUN_URL" \
+              || echo "::warning::could not comment on issue #$existing (the caller needs issues: write)"
+          else
+            gh issue create --title "Security automation is failing" --label "$label" --body "$body" \
+              || echo "::warning::could not open an issue (the caller needs issues: write)"
+          fi
+
+      - name: Close failure issue
+        if: success() && inputs.dry_run != true && inputs.target_branch == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for n in $(gh issue list --label security-automation-failure --state open --json number --jq '.[].number' 2>/dev/null || true); do
+            gh issue close "$n" --comment "Recovered: $RUN_URL" || true
+          done

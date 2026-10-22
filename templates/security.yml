@@ -1,0 +1,45 @@
+# Copy to .github/workflows/security.yml in a repo. Adjust the `with:` block.
+name: Security
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # nightly
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Scan, fix and test, but do not push"
+        type: boolean
+        default: true
+      target_branch:
+        description: "Fix and push to this branch instead of the default branch (testing)"
+        type: string
+        default: ""
+      force_rebuild:
+        description: "Dispatch the rebuild workflow now"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: security
+  cancel-in-progress: false
+
+jobs:
+  security:
+    uses: sloccy/shared-ci/.github/workflows/security.yml@v1
+    with:
+      dry_run: ${{ inputs.dry_run == true }}
+      target_branch: ${{ inputs.target_branch || '' }}
+      force_rebuild: ${{ inputs.force_rebuild == true }}
+      # test_command: ./scripts/vendor.sh && go build ./... && go test ./...
+      # lint_command: golangci-lint run ./...
+      # extra_fix_script: ./scripts/my-extra-fix.sh
+      # binaries: |
+      #   https://example.com/some-go-binary
+      # rebuild_workflow: build.yml
+      # rebuild_weekday: 1
+    secrets:
+      token: ${{ secrets.WORKFLOW_TOKEN }}
