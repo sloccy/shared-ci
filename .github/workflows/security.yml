@@ -208,8 +208,9 @@ jobs:
       # `overrides` entry, tracked in package.json under "x-security-overrides" so only
       # overrides this job created are ever pruned (once nothing needs them any more).
       # Fixes are applied one at a time and rolled back individually if npm cannot
-      # resolve them. Packages whose fix needs a major bump are only warned about. Works
-      # without a committed lockfile (a temporary one is generated and discarded).
+      # resolve them. When the minimum fix is in a later major, that major bump is applied
+      # automatically too (the test gate decides whether it ships). Works without a
+      # committed lockfile (a temporary one is generated and discarded).
       - name: npm - bump vulnerable packages to the minimum fixed version
         if: steps.detect.outputs.npm == 'true'
         run: |
@@ -276,15 +277,15 @@ jobs:
               const isDirect = name in direct;
               if ((pass === 'direct') !== isDirect) continue;
               const ranges = [...new Set(own.map((x) => x.range))];
-              const installed = [...new Set((v.nodes ?? []).map((n) => lock.packages?.[n]?.version).filter(Boolean))];
-              if (installed.length !== 1) { manual.push(`${name}: installed at ${installed.join(', ') || 'unknown'}; needs a manual look`); continue; }
-              const from = installed[0];
-              const to = minFixed(name, from, ranges, true);
-              if (!to) {
-                const major = minFixed(name, from, ranges, false);
-                manual.push(`${name}@${from}: no fix inside major ${semver.major(from)}${major ? ` (first fixed: ${major})` : ''}`);
-                continue;
-              }
+              const installed = [...new Set((v.nodes ?? []).map((n) => lock.packages?.[n]?.version).filter(Boolean))].sort(semver.compare);
+              if (!installed.length) { manual.push(`${name}: installed version not found in the lockfile`); continue; }
+              // Lowest fix above each installed copy: inside its own major when one exists,
+              // otherwise the lowest fix in a later major (applied automatically; the test gate
+              // and per-fix rollback guard it). One pin must satisfy every installed copy.
+              const targets = installed.map((f) => minFixed(name, f, ranges, true) ?? minFixed(name, f, ranges, false));
+              if (targets.some((t) => !t)) { manual.push(`${name}@${installed.join(', ')}: no fixed version has been published yet`); continue; }
+              const to = targets.sort(semver.compare).at(-1);
+              const from = installed.join(' + ');
               out.push({ name, from, min: to, to: isDirect ? newestPatch(name, to, ranges) : to, isDirect, urls: urlsOf(own) });
             }
             return out;
@@ -347,7 +348,7 @@ jobs:
           if (pruned.length) fs.appendFileSync(summaryFile, `npm overrides no longer needed, removed: ${pruned.join(', ')}\n`);
           for (const m of manual) console.log(`::warning::npm: ${m}`);
           if (failed.length) fs.writeFileSync(failuresFile, failed.map((f) => `- ${f}`).join('\n') + '\n');
-          console.log(`npm: ${applied.length} fixed, ${pruned.length} overrides pruned, ${failed.length} could not be applied, ${manual.length} need a major bump or manual work`);
+          console.log(`npm: ${applied.length} fixed, ${pruned.length} overrides pruned, ${failed.length} could not be applied, ${manual.length} have no published fix`);
           JS
 
           # The npm bundled with some Node releases crashes on certain trees
@@ -502,7 +503,7 @@ jobs:
       # ── Keep the schedule alive ────────────────────────────────────────────
       # GitHub disables scheduled workflows in public repos after 60 days without repo
       # activity. Re-enabling this workflow is a best-effort way to reset that timer
-      # (community-reported, not documented). GitHub's Dependabot alerts remain the backstop.
+      # (community-reported, not documented).
       - name: Keep schedule enabled
         if: github.event_name == 'schedule' && inputs.target_branch == ''
         continue-on-error: true
