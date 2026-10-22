@@ -77,7 +77,7 @@ jobs:
           echo "SUMMARY_FILE=$RUNNER_TEMP/summary.md" >> "$GITHUB_ENV"
           echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
           [ -f go.mod ] && echo "go=true" >> "$GITHUB_OUTPUT" || echo "go=false" >> "$GITHUB_OUTPUT"
-          [ -f package-lock.json ] && echo "npm=true" >> "$GITHUB_OUTPUT" || echo "npm=false" >> "$GITHUB_OUTPUT"
+          [ -f package.json ] && echo "npm=true" >> "$GITHUB_OUTPUT" || echo "npm=false" >> "$GITHUB_OUTPUT"
           : > "$RUNNER_TEMP/summary.md"
 
       - uses: actions/setup-go@v6
@@ -154,52 +154,123 @@ jobs:
           go mod tidy
 
       # ── Fix: npm ───────────────────────────────────────────────────────────
-      - name: npm - audit and bump vulnerable packages
+      # Bumps each vulnerable package to the LOWEST version that clears its advisories
+      # (not the newest in range, which is what `npm audit fix` does and which also
+      # crashed/ERESOLVEd on a real repo). Direct dependencies get their spec edited;
+      # vulnerable transitive ones get a pinned `overrides` entry. Fixes are applied one
+      # at a time and rolled back individually if npm cannot resolve them. Packages whose
+      # fix needs a major bump are only warned about. Works without a committed lockfile
+      # (a temporary one is generated for the audit and discarded).
+      - name: npm - bump vulnerable packages to the minimum fixed version
         if: steps.detect.outputs.npm == 'true'
         run: |
           set -euo pipefail
-          # The npm bundled with Node LTS crashed in `audit fix` on a real repo
-          # ("Cannot read properties of null (reading 'edgesOut')"); current npm is fine.
-          npm install -g npm@latest
-          npm ci --no-audit --no-fund
-          npm audit --json > "$RUNNER_TEMP/audit.json" || true
+          cat > "$RUNNER_TEMP/npm-min-fix.mjs" <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { createRequire } from 'node:module';
+          import fs from 'node:fs';
 
-          # Advisories we are about to fix, for the commit message.
-          urls=$(jq -r '[.vulnerabilities[]?.via[]? | select(type == "object") | .url] | unique | .[]' "$RUNNER_TEMP/audit.json" 2>/dev/null || true)
-          [ -z "$urls" ] && { echo "npm: no vulnerabilities."; exit 0; }
+          const run = (args, opts = {}) => execFileSync('npm', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+          const npmRoot = run(['root', '-g']).trim();
+          const semver = createRequire(`${npmRoot}/npm/package.json`)('semver'); // bundled with npm
 
-          # 1) semver-compatible fixes (lockfile only). A non-zero exit is not fatal by
-          #    itself (it can mean "some vulnerabilities remain"); the check below decides.
-          npm audit fix --no-audit --no-fund || echo "::warning::npm audit fix exited non-zero"
+          const summaryFile = process.env.SUMMARY_FILE;
+          const failuresFile = `${process.env.RUNNER_TEMP}/npm-failures.txt`;
+          const read = (f) => fs.readFileSync(f, 'utf8');
+          const indent = (txt) => (txt.match(/^[ \t]+(?=")/m) || ['  '])[0];
+          const writePkg = (pkg, txt) => fs.writeFileSync('package.json', JSON.stringify(pkg, null, indent(txt)) + '\n');
+          const audit = () => {
+            let out;
+            try { out = run(['audit', '--json']); } catch (e) { out = e.stdout; } // exit 1 when vulnerable
+            return JSON.parse(out || '{}');
+          };
+          const relock = () => run(['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund']);
 
-          # 2) direct dependencies with an exact pin (e.g. vendored front-end libs) that
-          #    audit fix leaves alone: bump to the fixed version when it is not a major.
-          npm audit --json > "$RUNNER_TEMP/audit2.json" || true
-          jq -r '.vulnerabilities[]? | select(.isDirect == true)
-                 | select((.fixAvailable | type) == "object")
-                 | select(.fixAvailable.isSemVerMajor == false)
-                 | "\(.fixAvailable.name)@\(.fixAvailable.version)"' "$RUNNER_TEMP/audit2.json" | sort -u |
-          while read -r pkg; do
-            name="${pkg%@*}"
-            spec=$(jq -r --arg n "$name" '(.dependencies[$n] // .devDependencies[$n] // "")' package.json)
-            if [[ "$spec" =~ ^[0-9] ]]; then npm install "$pkg" --save-exact --no-audit --no-fund
-            else npm install "$pkg" --no-audit --no-fund; fi
-          done
+          const applied = [], failed = [], manual = [];
+          const urlsOf = (own) => [...new Set(own.map((x) => x.url).filter(Boolean))];
 
-          # Fail loudly if a fix that npm says exists without a major bump is still
-          # unapplied (a silent no-op here is how coverage quietly disappears).
-          npm audit --json > "$RUNNER_TEMP/audit3.json" || true
-          unfixed=$(jq -r '[.vulnerabilities[]? | select(.fixAvailable == true or ((.fixAvailable | type) == "object" and .fixAvailable.isSemVerMajor == false)) | .name] | join(", ")' "$RUNNER_TEMP/audit3.json")
-          if [ -n "$unfixed" ]; then
-            echo "::error::npm reports fixes without a major bump that were not applied: $unfixed"
-            exit 1
-          fi
-          remaining=$(jq -r '[.vulnerabilities[]?.name] | join(", ")' "$RUNNER_TEMP/audit3.json")
-          [ -n "$remaining" ] && echo "::warning::npm vulnerabilities needing a major bump or manual work: $remaining"
+          // The lowest stable version above `from` that no own-advisory range covers.
+          function minFixed(name, from, ranges, sameMajor) {
+            const versions = JSON.parse(run(['view', name, 'versions', '--json']));
+            return versions
+              .filter((v) => !semver.prerelease(v))
+              .sort(semver.compare)
+              .find((v) => semver.gt(v, from)
+                && (!sameMajor || semver.major(v) === semver.major(from))
+                && !ranges.some((r) => semver.satisfies(v, r)));
+          }
 
-          if ! git diff --quiet -- package.json package-lock.json; then
-            { echo "npm audit fixes:"; while read -r line; do echo "- $line"; done <<< "$urls"; } >> "$SUMMARY_FILE"
-          fi
+          function plan(pass) {
+            const a = audit();
+            const lock = JSON.parse(read('package-lock.json'));
+            const pkg = JSON.parse(read('package.json'));
+            const direct = { ...pkg.optionalDependencies, ...pkg.devDependencies, ...pkg.dependencies };
+            const out = [];
+            for (const [name, v] of Object.entries(a.vulnerabilities ?? {})) {
+              const own = (v.via ?? []).filter((x) => typeof x === 'object' && x.name === name);
+              if (!own.length) continue; // vulnerable only through a dependency: fixed at its source
+              const isDirect = name in direct;
+              if ((pass === 'direct') !== isDirect) continue;
+              const ranges = [...new Set(own.map((x) => x.range))];
+              const installed = [...new Set((v.nodes ?? []).map((n) => lock.packages?.[n]?.version).filter(Boolean))];
+              if (installed.length !== 1) { manual.push(`${name}: installed at ${installed.join(', ') || 'unknown'}; needs a manual look`); continue; }
+              const from = installed[0];
+              const to = minFixed(name, from, ranges, true);
+              if (!to) {
+                const major = minFixed(name, from, ranges, false);
+                manual.push(`${name}@${from}: no fix inside major ${semver.major(from)}${major ? ` (first fixed: ${major})` : ''}`);
+                continue;
+              }
+              out.push({ name, from, to, isDirect, urls: urlsOf(own) });
+            }
+            return out;
+          }
+
+          function apply(fix) {
+            const pkgTxt = read('package.json'), lockTxt = read('package-lock.json');
+            const pkg = JSON.parse(pkgTxt);
+            if (fix.isDirect) {
+              for (const sec of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+                const spec = pkg[sec]?.[fix.name];
+                if (spec === undefined) continue;
+                const prefix = /^[\^~]/.test(spec) ? spec[0] : '';
+                pkg[sec][fix.name] = prefix + fix.to;
+              }
+            } else {
+              pkg.overrides = { ...(pkg.overrides ?? {}), [fix.name]: fix.to };
+            }
+            writePkg(pkg, pkgTxt);
+            try {
+              relock();
+              applied.push(fix);
+            } catch (e) {
+              fs.writeFileSync('package.json', pkgTxt);
+              fs.writeFileSync('package-lock.json', lockTxt);
+              failed.push(`${fix.name} ${fix.from} -> ${fix.to}: ${(e.stderr || e.message).split('\n').find((l) => /ERESOLVE|error/.test(l)) ?? 'npm could not resolve it'}`);
+            }
+          }
+
+          for (const pass of ['direct', 'transitive']) {
+            for (const fix of plan(pass)) apply(fix);
+          }
+
+          const lines = applied.map((f) => `- ${f.name} ${f.from} -> ${f.to}${f.isDirect ? '' : ' (override)'} ${f.urls.join(' ')}`);
+          if (lines.length) fs.appendFileSync(summaryFile, `npm minimum-version fixes:\n${lines.join('\n')}\n`);
+          for (const m of manual) console.log(`::warning::npm: ${m}`);
+          if (failed.length) fs.writeFileSync(failuresFile, failed.map((f) => `- ${f}`).join('\n') + '\n');
+          console.log(`npm: ${applied.length} fixed, ${failed.length} could not be applied, ${manual.length} need a major bump or manual work`);
+          JS
+
+          # The npm bundled with some Node releases crashes on certain trees
+          # ("Cannot read properties of null (reading 'edgesOut')"); current npm does not.
+          npm install -g npm@latest || echo "::warning::could not upgrade npm; using the bundled one"
+
+          had_lock=true
+          [ -f package-lock.json ] || { had_lock=false; npm install --package-lock-only --ignore-scripts --no-audit --no-fund; }
+          npm ci --no-audit --no-fund --ignore-scripts
+          node "$RUNNER_TEMP/npm-min-fix.mjs"
+          # A lockfile we generated only for the audit is not part of the repo.
+          [ "$had_lock" = "true" ] || rm -f package-lock.json
 
       - name: Extra fixes (repo script)
         if: inputs.extra_fix_script != ''
@@ -286,6 +357,15 @@ jobs:
           fi
           echo "pushed=true" >> "$GITHUB_OUTPUT"
 
+      - name: Fail if some fixes could not be applied
+        if: always() && steps.detect.outputs.npm == 'true'
+        run: |
+          if [ -s "$RUNNER_TEMP/npm-failures.txt" ]; then
+            echo "::error::Some npm fixes could not be applied (the others were pushed):"
+            cat "$RUNNER_TEMP/npm-failures.txt"
+            exit 1
+          fi
+
       # ── Shipped binaries (e.g. cloudflared) ────────────────────────────────
       - name: Scan shipped binaries
         if: inputs.binaries != ''
@@ -361,6 +441,12 @@ jobs:
 
           Fixes it was trying to apply:
           $(cat "$SUMMARY_FILE")"
+          fi
+          if [ -s "$RUNNER_TEMP/npm-failures.txt" ]; then
+            body="$body
+
+          npm fixes that could not be applied:
+          $(cat "$RUNNER_TEMP/npm-failures.txt")"
           fi
           existing=$(gh issue list --label "$label" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$existing" ]; then
