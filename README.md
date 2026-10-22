@@ -38,7 +38,3 @@ newest), never for routine version bumps. *Direct* dependencies (npm direct deps
 `// indirect`) then move to the newest patch release in that same minor; indirect/override pins and
 the Go toolchain version stay at the minimum. (Not covered by "minimum": base images and tools that
 are rebuilt at their latest, e.g. Chainguard and cloudflared.) Dependabot security *PRs* are off; its alerts stay on.
-
-## Legacy workflows
-`vuln-autofix.yml` and `dependabot-auto-merge.yml` are the previous PR-based flow and are
-removed once every repo has moved to `security.yml`.
