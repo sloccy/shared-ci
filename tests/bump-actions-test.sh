@@ -30,7 +30,7 @@ release() { printf '%s\t%s\n' "$2" "$3" > "$FIX/rel_$(echo "$1" | tr / _)"; }
 tag()     { : > "$FIX/tag_$(echo "$1" | tr / _)_$2"; }
 run()     { (cd "$W/repo" && FIX="$FIX" PATH="$W/bin:$PATH" SUMMARY_FILE="$W/summary" bash "$ROOT/scripts/bump-actions.sh" "${1:-7}" > "$W/out" 2>&1); }
 check()   { # description, command that must succeed
-  if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAILS=$((FAILS + 1)); cat "$W/out" 2>/dev/null | sed 's/^/     /'; fi
+  if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAILS=$((FAILS + 1)); sed 's/^/     /' "$W/out" 2>/dev/null; fi
 }
 has()  { grep -qF -- "$2" "$W/repo/$1"; }
 lacks() { ! grep -qF -- "$2" "$W/repo/$1"; }
