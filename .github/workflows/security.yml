@@ -46,9 +46,21 @@ on:
         description: "Branch to fix and push to instead of the default branch (testing)."
         type: string
         default: ""
+      bump_actions:
+        description: "Move version-pinned GitHub Actions (uses: owner/repo@vN) to the newest stable major. Needs a token that can write workflow files."
+        type: boolean
+        default: true
+      actions_min_age_days:
+        description: "Only adopt an action release that is at least this many days old."
+        type: number
+        default: 7
+      watch_minutes:
+        description: "After pushing an actions bump, wait up to this long for the repo's own build on that commit and fail (opening the failure issue) if it fails. 0 = do not wait."
+        type: number
+        default: 25
     secrets:
       token:
-        description: "Owner PAT with Contents read/write. Needed so the push triggers the repo's own workflows."
+        description: "Owner PAT with Contents read/write (plus Workflows read/write to bump actions). Needed so the push triggers the repo's own workflows."
         required: true
 
 permissions:
@@ -60,7 +72,7 @@ jobs:
   security:
     name: Scan, fix, test, push
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75 # up to 25 of them can be spent watching the build after an actions bump
     env:
       GH_TOKEN: ${{ secrets.token }}
       DRY_RUN: ${{ inputs.dry_run }}
@@ -478,9 +490,128 @@ jobs:
           done <<< "$BINARIES"
           exit $status
 
+      # ── GitHub Actions pins ────────────────────────────────────────────────
+      # Policy exception: actions move to the newest stable major (at least actions_min_age_days
+      # old) instead of the minimum fixed version. They are CI tooling, not shipped code, and
+      # majors are how they retire old runtimes. Runs last so a token that cannot write
+      # workflow files never blocks the security fixes pushed above.
+      - name: Actions - bump pinned versions
+        id: actions
+        if: inputs.bump_actions
+        env:
+          MIN_AGE: ${{ inputs.actions_min_age_days }}
+          RUN_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The commit of this reusable workflow, as the run itself records it, so the script
+          # matches the workflow version the caller pinned (a tag or a branch under test).
+          sha=$(GH_TOKEN="$RUN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --jq '.referenced_workflows[] | select(.path | startswith("sloccy/shared-ci/")) | .sha' | head -1 || true)
+          curl -fsSL "https://raw.githubusercontent.com/sloccy/shared-ci/${sha:-v1}/scripts/bump-actions.sh" \
+            -o "$RUNNER_TEMP/bump-actions.sh"
+          : > "$RUNNER_TEMP/actions-summary.md"
+          SUMMARY_FILE="$RUNNER_TEMP/actions-summary.md" bash "$RUNNER_TEMP/bump-actions.sh" "$MIN_AGE"
+          if git diff --quiet; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Actions - lint the changed workflows
+        if: steps.actions.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) latest "$RUNNER_TEMP"
+          # shellcheck and pyflakes are off: this gate is about the bump, not the repo's existing scripts
+          git diff --name-only | xargs "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+
+      - name: Actions - commit and push
+        id: actions_push
+        if: steps.actions.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          {
+            echo "chore: update GitHub Actions"
+            echo
+            cat "$RUNNER_TEMP/actions-summary.md"
+            echo
+            echo "Automated by the sloccy/shared-ci security workflow."
+          } > "$RUNNER_TEMP/actions-msg.txt"
+          git commit -q -F "$RUNNER_TEMP/actions-msg.txt"
+          {
+            echo "### GitHub Actions bumped"
+            cat "$RUNNER_TEMP/actions-summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/actions-summary.md" >> "$SUMMARY_FILE"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: not pushing."
+            git show --stat --format=%s HEAD
+            exit 0
+          fi
+          if ! out=$(git push origin "HEAD:$BRANCH" 2>&1); then
+            echo "$out"
+            if grep -qi 'workflow' <<< "$out"; then
+              echo "::error::The token cannot update workflow files. Give WORKFLOW_TOKEN 'Workflows: Read and write' (fine-grained token) or the 'workflow' scope (classic) for this repository, or set bump_actions: false."
+              exit 1
+            fi
+            echo "Push rejected; rebasing once onto the updated branch."
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH"
+            git push origin "HEAD:$BRANCH"
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # A bad major can break the repo's own build. Report it (the failure issue names the commit
+      # to revert) rather than reverting automatically.
+      - name: Actions - watch the repo's build on the pushed commit
+        if: steps.actions_push.outputs.pushed == 'true' && inputs.watch_minutes > 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.actions_push.outputs.sha }}
+          MINUTES: ${{ inputs.watch_minutes }}
+          THIS_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          runs() { gh run list --commit "$SHA" --limit 50 --json databaseId,name,status,conclusion \
+            --jq "[.[] | select(.databaseId != $THIS_RUN)]"; }
+          # runs on the pushed commit take a moment to appear (none will on a scratch branch)
+          for _ in $(seq 10); do
+            [ "$(runs | jq length)" -gt 0 ] && break
+            sleep 30
+          done
+          if [ "$(runs | jq length)" -eq 0 ]; then
+            echo "::notice::No workflow run started for $SHA within 5 minutes; nothing to watch."
+            exit 0
+          fi
+          deadline=$(( $(date +%s) + MINUTES * 60 ))
+          while :; do
+            j=$(runs)
+            bad=$(jq -r '.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") | .name' <<< "$j")
+            if [ -n "$bad" ]; then
+              {
+                echo
+                echo "The repo's build failed after the actions bump ($SHA): $(echo "$bad" | paste -sd, -)."
+                echo "If the bump is the cause, undo it with: git revert $SHA"
+              } | tee -a "$SUMMARY_FILE"
+              echo "::error::Build failed after the actions bump. Revert with: git revert $SHA"
+              exit 1
+            fi
+            if [ "$(jq '[.[] | select(.status != "completed")] | length' <<< "$j")" -eq 0 ]; then
+              echo "The repo's build passed on $SHA."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::notice::The build was still running after $MINUTES minutes; not waiting longer."
+              exit 0
+            fi
+            sleep 30
+          done
+
       # ── Weekly rebuild ─────────────────────────────────────────────────────
       - name: Weekly rebuild
-        if: inputs.rebuild_workflow != '' && steps.push.outputs.pushed != 'true'
+        if: inputs.rebuild_workflow != '' && steps.push.outputs.pushed != 'true' && steps.actions_push.outputs.pushed != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW: ${{ inputs.rebuild_workflow }}

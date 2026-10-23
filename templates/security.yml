@@ -38,6 +38,8 @@ jobs:
       # test_command: ./scripts/vendor.sh && go build ./... && go test ./...
       # lint_command: golangci-lint run ./...
       # extra_fix_script: ./scripts/my-extra-fix.sh
+      # bump_actions: false        # leave `uses: owner/repo@vN` pins alone (default: move to the newest major)
+      # watch_minutes: 0           # do not wait for the build after an actions bump (default 25)
       # binaries: |
       #   https://example.com/some-go-binary
       # rebuild_workflow: build.yml

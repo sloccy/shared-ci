@@ -16,6 +16,7 @@ rebuild. If anything fails: one issue. Dependabot alerts and security PRs are of
 | Gate | `test_command` (default: Go build+test / `npm test`), optional `lint_command`, then govulncheck must be clean |
 | Push | commit by `github-actions[bot]` listing modules + advisory IDs, pushed with the owner PAT so the repo's own publish/deploy workflow runs |
 | `binaries` | `govulncheck -mode=binary` on shipped Go binaries (e.g. cloudflared); a finding turns the run red |
+| GitHub Actions | `uses: owner/repo@vN` pins in `.github/workflows` move to the newest stable **major** (release at least `actions_min_age_days` old, default 7; the moving `vN` tag must exist), checked with `actionlint`, committed and pushed **after** the fixes above. Then it waits up to `watch_minutes` (default 25) for the repo's own build on that commit; if it fails, the run fails and the issue names the commit to `git revert` (nothing is reverted automatically). `sloccy/shared-ci` pins, local, `docker://` and SHA pins are left alone. Off with `bump_actions: false`. |
 | Weekly rebuild | dispatches `rebuild_workflow` on `rebuild_weekday` (skipped when the nightly already pushed) |
 | Failure | opens/comments on one `security-automation-failure` issue; closes it on the next green run |
 
@@ -25,12 +26,12 @@ pusher); set `lint_command` to make it part of the gate instead.
 
 ### Using it
 Copy `templates/security.yml` to `.github/workflows/security.yml` and add the secret
-`WORKFLOW_TOKEN`: a fine-grained PAT for that repo with *Contents* read/write and an expiry. (Issues and
+`WORKFLOW_TOKEN`: a fine-grained PAT for that repo with *Contents* read/write, *Workflows* read/write (needed to bump actions: GitHub refuses a push that changes workflow files otherwise) and an expiry. (Issues and
 workflow dispatch use the built-in `GITHUB_TOKEN`; the caller grants `issues: write` and `actions: write`.) The owner must be able to bypass branch protection on the default
 branch. Call the workflow at `@v1` (never `@main`).
 
 ### Testing a change
-Run the caller's workflow manually. `dry_run` (default on for manual runs) scans, fixes and
+`tests/bump-actions-test.sh` covers the actions bump script (runs on every push). Run the caller's workflow manually. `dry_run` (default on for manual runs) scans, fixes and
 tests but does not push. `target_branch` runs the whole flow against a scratch branch.
 
 ### Policy
@@ -39,3 +40,7 @@ newest), never for routine version bumps. *Direct* dependencies (npm direct deps
 `// indirect`) then move to the newest patch release in that same minor; indirect/override pins and
 the Go toolchain version stay at the minimum. (Not covered by "minimum": base images and tools that
 are rebuilt at their latest, e.g. Chainguard and cloudflared.) Dependabot alerts and security PRs are off.
+
+GitHub Actions are the one exception: they move to the newest stable major (at least
+`actions_min_age_days` old). They are CI tooling, not shipped code, and majors are how they retire
+old runtimes, so waiting for a "vulnerability" would mean waiting for a forced break.
