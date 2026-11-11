@@ -41,7 +41,8 @@ jobs:
       # bump_actions: false        # leave `uses: owner/repo@vN` pins alone (default: move to the newest major)
       # watch_minutes: 0           # do not wait for the build after an actions bump (default 25)
       # binaries: |
-      #   https://example.com/some-go-binary
+      #   https://example.com/some-go-binary /path/in/image
+      # image: ghcr.io/owner/repo:latest   # rebuild at once when a shipped binary is fixed upstream
       # rebuild_workflow: build.yml
       # rebuild_weekday: 1
     secrets:

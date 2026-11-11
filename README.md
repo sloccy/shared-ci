@@ -15,9 +15,9 @@ rebuild. If anything fails: one issue. Dependabot alerts and security PRs are of
 | `extra_fix_script` | repo-specific bumps (e.g. a pinned Lambda layer) |
 | Gate | `test_command` (default: Go build+test / `npm test`), optional `lint_command`, then govulncheck must be clean |
 | Push | commit by `github-actions[bot]` listing modules + advisory IDs, pushed with the owner PAT so the repo's own publish/deploy workflow runs |
-| `binaries` | `govulncheck -mode=binary` on shipped Go binaries (e.g. cloudflared); a finding turns the run red |
+| `binaries` (+ `image`) | `govulncheck -mode=binary` on the latest upstream release of each shipped Go binary (e.g. cloudflared) and, with `image` and a `<url> <path-in-image>` line, on the copy inside the published image. Vulnerable in the image but fixed upstream: **rebuild immediately**. Vulnerable upstream too: an informational `upstream-binary-vuln` issue (nothing to fix here), closed once a fix ships. Findings never fail the run; download/extract errors do. |
 | GitHub Actions | `uses: owner/repo@vN` pins in `.github/workflows` move to the newest stable **major** (release at least `actions_min_age_days` old, default 7; the moving `vN` tag must exist), checked with `actionlint`, committed and pushed **after** the fixes above. Then it waits up to `watch_minutes` (default 25) for the repo's own build on that commit; if it fails, the run fails and the issue names the commit to `git revert` (nothing is reverted automatically). `sloccy/shared-ci` pins, local, `docker://` and SHA pins are left alone. Off with `bump_actions: false`. |
-| Weekly rebuild | dispatches `rebuild_workflow` on `rebuild_weekday` (skipped when the nightly already pushed) |
+| Weekly rebuild | dispatches `rebuild_workflow` on `rebuild_weekday` (skipped when the nightly already pushed or already rebuilt for an upstream fix) |
 | Failure | opens/comments on one `security-automation-failure` issue; closes it on the next green run |
 
 If the gate fails, **nothing is pushed**; the run fails with the exact bump list in the issue.
